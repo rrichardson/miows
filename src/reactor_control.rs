@@ -1,9 +1,14 @@
 use protocol::Protocol;
+use mio::tcp::{TcpStream, TcpListener};
+use mio::util::{Slab};
+use std::net;
 
 trait ReactorHandler<T>
 where T : Protocol, <T as Protocol>::Output : Send
     fn on_message(&mut self, msg: <T as Protocol>::Output, ctrl : ReactorControl<T>);
 }
+
+struct Connection<P : Protocol> (P, TcpStream);
 
 struct ReactorControl<T, H>
 where T : Protocol, <T as Protocol>::Output : Send,
@@ -11,7 +16,7 @@ where T : Protocol, <T as Protocol>::Output : Send,
 {
     listeners: Slab<(TcpAcceptor, SyncSender<ProtoMsg<<T as Protocol>::Output>>)>,
     conns: Slab<Connection<T>>,
-    config: NetEngineConfig,
+    config: ReactorConfig,
 }
 
 impl<T> ReactorControl<T>
@@ -22,30 +27,36 @@ where T : Protocol, <T as Protocol>::Output : Send,
     pub fn new(cfg: NetEngineConfig) -> ReactorControl<T> {
 
         ReactorControl {
-            listeners: Slab::new_starting_at(Token(0), 128),
+            listeners: Slab::new_starting_at(Token(0), 255),
             conns: Slab::new_starting_at(Token(256), cfg.max_connections + 256),
             config: cfg
         }
     }
 
     pub fn connect<'b>(&mut self,
-                   hostname: &str,
+                   addr: &str,
                    port: usize,
-                   event_loop: &mut Reactor) -> Result<NetStream<'b, <T as Protocol>::Output>, String>
+                   event_loop: &mut Reactor) -> Result<Token, String>
     {
-        let ip = get_host_addresses(hostname).unwrap()[0]; //TODO manage receiving multiple IPs per hostname, random sample or something
+        Ok(self).map(|s| net::lookup_host(addr).map(|lh| (s, lh)))
+            .and_then(|(s,lh)| lh.nth(0).map(|a| (s, a)))
+                .ok_or(format!("Failed to find host for {}", addr))
+            .map(move |(s,a)| match a {
+                V4(sa4) => (s, SockAddrV4::new(sa4.ip(), port)),
+                V6(sa6) => (s, SockAddrV6::new(sa6.ip(), port)) })
+            .and_then(|(s,ad)| TcpStream::connect(ad).map(|sock| (s, sock)))
+            .and_then(|(s,sock)| s.conns.insert((T::new(), sock)).map(|tok| (s, tok, sock)))
+            .and_then(|(s,sock)| s.event_loop.register_opt(sock, tok, event::READABLE, event::PollOpt::edge()).
+                .map(|_| tok))
+            .map_err(|e| format!("Failed to register connection in Slab: {}", e))
+    }
+
         match TcpSocket::v4() {
             Ok(s) => {
-                //s.set_tcp_nodelay(true); TODO: re-add to mio
-                let (tx, rx) = sync_channel(self.config.queue_size);
-                let buf = new_buf(self.config.read_buf_sz, self.config.allocator.clone());
-                match self.conns.insert(Connection::new(s, tx, buf)) {
+                match self.conns.insert(Connection(T::new(), s)) {
                     Ok(tok) => match event_loop.register_opt(&self.conns.get(tok).unwrap().sock, tok, event::READABLE, event::PollOpt::edge()) {
                         Ok(..) => match self.conns.get(tok).unwrap().sock.connect(&SockAddr::InetAddr(ip, port as u16)) {
-                            Ok(..) => {
-                                debug!("Connected to server for token {:?}", tok);
-                                Ok(NetStream::new(tok, rx, event_loop.channel().clone()))
-                            }
+                            Ok(..) => Ok(tok)
                             Err(e) => Err(format!("Failed to connect to {:?}:{:?}, error: {:?}", hostname, port, e))
                         },
                         Err(e)      => Err(format!("Failed to register with the event loop, error: {:?}", e))
