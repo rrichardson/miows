@@ -2,3 +2,8 @@
 name = "miows"
 version = "0.1.0"
 authors = ["Rick Richardson <rick.richardson@gmail.com>"]
+
+
+[dependencies]
+websocket = "*"
+mio = "*"
