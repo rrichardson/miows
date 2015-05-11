@@ -1,9 +1,39 @@
 
-use bytes::{MutBuf};
+use bytes::{MutBuf, Buf};
 use mio::TryRead;
 
 type ClientId = usize;
 type MsgId = usize;
+
+/// This enum contains the high level constructs
+/// this protocol will use to speak with the
+/// reactor, or to its message handler,
+/// or to another layer up the stack.
+///
+/// Send instructs the reactor to enqueue a message
+/// to the connection associated with this protocol
+/// instance.
+///
+/// Timer instructs the reactor to set a timer for usize
+/// milliseconds from now, notifying the protocol at
+/// that occurence with the supplied msg id
+///
+/// Kill tells the reactor to send a message to the
+/// endpoint, then close the tcp session, it will
+/// then supply the msg at the callback on_disconnect
+///
+/// Out sends a Protocol::Output message to the
+/// app's main message handler
+///
+/// Up sends a message directed towards a higher
+/// level protocol handler in the stack
+enum Message<T : Buf, M : Send> {
+    Send(T, MsgId),
+    Timer(usize, MsgId),
+    Kill(T, MsgId),
+    Out(M),
+    Up(M)
+}
 
 pub trait Protocol {
     type Output : Send;
