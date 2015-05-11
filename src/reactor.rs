@@ -1,3 +1,5 @@
+use mio::Sender;
+use mio::EventLoop;
 
 use reactor_control::*;
 use block_allocator::Allocator;
@@ -19,7 +21,7 @@ where T : Protocol, <T as Protocol>::Output : Send,
       H : ReactorHandler<<T as Protocol>::Output>
 {
     inner: ReactorControl<T, H>,
-    event_loop: EventLoop<ReactorInner<T, H>>
+    event_loop: EventLoop<ReactorControl<T, H>>
 }
 
 
@@ -45,7 +47,7 @@ where T : Protocol, <T as Protocol>::Output : Send,
         Reactor { event_loop: EventLoop::configured(
                     EventLoop::<ReactorInner<T>>::event_loop_config(
                         cfg.out_queue_size, cfg.poll_timeout_ms, config.max_timetouts)).unwrap(),
-                  inner: EngineInner::new(handler, cfg)
+                  inner: ReactorControl::new(handler, cfg)
         }
     }
 
@@ -65,7 +67,7 @@ where T : Protocol, <T as Protocol>::Output : Send,
     /// and sent down the supplied Sender channel along with the Token of the connection
     pub fn connect<'b>(&mut self,
                    hostname: &str,
-                   port: usize) -> Result<NetStream<'b, <T as Protocol>::Output>, String> {
+                   port: usize) -> Result<Token, String> {
         self.inner.connect(hostname, port, &mut self.event_loop)
     }
 
@@ -76,12 +78,12 @@ where T : Protocol, <T as Protocol>::Output : Send,
     /// this can be called multiple times for different ips/ports
     pub fn listen<'b>(&mut self,
                   addr: &'b str,
-                  port: usize) -> Result<Receiver<ProtoMsg<<T as Protocol>::Output>>, String> {
+                  port: usize) -> Result<Token, String> {
         self.inner.listen(addr, port, &mut self.event_loop)
     }
 
     /// fetch the event_loop channel for notifying the event_loop of new outbound data
-    pub fn channel(&self) -> EventLoopSender<StreamBuf> {
+    pub fn channel(&self) -> Sender<ReactorControl<T, H>> {
         self.event_loop.channel()
     }
 

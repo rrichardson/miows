@@ -7,6 +7,7 @@ extern crate bytes;
 pub use reactor;
 pub use reactor_control;
 pub use protocol;
+use connection;
 
 #[test]
 fn it_works() {

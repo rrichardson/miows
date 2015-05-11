@@ -1,35 +1,41 @@
 
-use iobuf::{AROIobuf, Iobuf};
+use bytes::{MutBuf};
+use mio::TryRead;
+
+type ClientId = usize;
+type MsgId = usize;
 
 pub trait Protocol {
-    type Output : Send + 'static;
+    type Output : Send;
 
     fn new() -> Self;
 
-    fn append(&mut self, &AROIobuf) -> Option<(Self::Output, AROIobuf, u32)>;
+    /// Static fn to create a message from data to be sent to a client
+    fn new_message(data: &[u8]) -> Option<Output>;
+
+    /// Invoked when new data has arrived
+    fn on_data<T : TryRead>(&mut self, io : &mut T) -> Option<Output>;
+
+    /// Invoked after a message produced by the protocol has been successfully sent
+    fn on_send(&mut self, cid : ClientId, mid : MsgId) -> Option<Output>;
+
+    /// Called on the disconnection of a client
+    fn on_disconnect(&mut self, cid : ClientId) -> Option<Output>;
+
+    /// Callback to handle new inbound connections
+    fn on_accept(&mut self, cid : ClientId, ip : SocketAddr) -> Option<Output>;
+
+    /// Callback to handle new outbound connections
+    fn on_connect(&mut self, cid : ClientId) -> Option<Output>;
+
+    /// Callback for the Reactor to handle timer events
+    /// return true to re-register the timeout, or false
+    /// to cancel
+    fn on_timer(&mut self, id : usize) -> bool -> Option<Output>;
+
+    /// Called before accepting a connection
+    fn on_pre_accept(&mut self, ip : SocketAddr) -> bool {
+        return true;
+    }
 }
 
-pub trait HasSize{ fn size() -> u32; }
-
-/// A simple Protocol implementation which produces buffers of a fixed size
-#[derive(Debug)]
-pub struct BufProtocol<S : HasSize>;
-
-
-impl<S : HasSize> Protocol for BufProtocol<S> {
-    type Output = AROIobuf;
-
-    fn new() -> BufProtocol<S> {
-        BufProtocol
-    }
-
-    fn append(&mut self, buf: &AROIobuf) -> Option<(<Self as Protocol>::Output, AROIobuf, u32)> {
-        let bufsz = <S as HasSize>::size();
-        if buf.len() >= bufsz {
-            let (a, b) = buf.split_at(bufsz).unwrap();
-            Some((a, b, bufsz))
-        } else {
-            None
-        }
-    }
-}

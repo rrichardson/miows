@@ -1,31 +1,25 @@
+use std::collections::VecDeque;
+use std::iobuf::AROIobuf;
+use mio::tcp::TcpStream;
 
-struct Connection<T>
-where T : Protocol, <T as Protocol>::Output : Send
+struct Connection
 {
-        sock: TcpSocket,
-        outbuf: DList<StreamBuf>,
+        sock: TcpStream,
+        outbuf: VecDeque<<AROIobuf>,
         interest: event::Interest,
-        conn_tx: SyncSender<ProtoMsg<<T as Protocol>::Output>>,
-        marker: i32,
-        proto: T,
-        buf: AppendBuf
 }
 
-impl<T> Connection<T>
-where T : Protocol, <T as Protocol>::Output : Send
+impl Connection
 {
-    pub fn new(s: TcpSocket, tx: SyncSender<ProtoMsg<<T as Protocol>::Output>>) -> Connection<T> {
+    pub fn new(s: TcpStream) -> Connection {
         Connection {
             sock: s,
-            outbuf: DList::new(),
+            outbuf: VecDeque::new(),
             interest: event::HUP,
-            conn_tx: tx,
-            marker: 0,
-            proto: <T as Protocol>::new(),
         }
     }
 
-    fn drain_write_queue_to_socket(&mut self) -> usize {
+    pub fn drain_write_queue_to_socket(&mut self) -> usize {
         let mut writable = true;
         while writable && self.outbuf.len() > 0 {
             let (result, sz) = {
@@ -52,7 +46,7 @@ where T : Protocol, <T as Protocol>::Output : Send
         self.outbuf.len()
     }
 
-    fn read(&mut self) -> MioResult<NonBlock<usize>> {
-        self.sock.read(proto)
+    pub fn enqueue(&mut self, buf : &AROIobuf) -> Option<()> {
+        outbuf.push_back(buf.clone())
     }
 }
