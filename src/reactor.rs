@@ -12,7 +12,7 @@ use protocol::Protocol;
 pub struct ReactorConfig {
     out_queue_size: usize,
     max_connections: usize,
-    max_timeouts: usize,
+    timers_per_connection: usize,
     poll_timeout_ms: usize,
 }
 
@@ -35,7 +35,7 @@ where T : Protocol, <T as Protocol>::Output : Send,
         let config = ReactorConfig {
             out_queue_size: 524288,
             max_connections: 10240,
-            max_timeouts: 40000,
+            timers_per_connection: 1,
             poll_timeout_ms: 100
         };
 

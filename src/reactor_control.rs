@@ -1,8 +1,10 @@
 use std::net;
 use iobuf::AROIobuf;
-use protocol::Protocol;
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::{Slab};
+
+use protocol::Protocol;
+use connection::Connection;
 
 type TaggedBuf = (Token, AROIobuf);
 
@@ -11,14 +13,12 @@ where T : Send
     fn on_message(&mut self, msg: T, ctrl : &mut ReactorControl<T, Self>);
 }
 
-struct Connection<P : Protocol> (P, TcpStream);
-
 struct ReactorControl<T, H>
 where T : Protocol, <T as Protocol>::Output : Send,
       H : ReactorHandler<<T as Protocol>::Output>
 {
     listeners: Slab<(TcpAcceptor, SyncSender<ProtoMsg<<T as Protocol>::Output>>)>,
-    conns: Slab<Connection<T>>,
+    conns: Slab<Protocol<T>, Connection>,
     config: ReactorConfig,
     handler: H
 }
@@ -29,10 +29,14 @@ where T : Protocol, <T as Protocol>::Output : Send,
 {
 
     pub fn new(handler: H, cfg: ReactorConfig) -> ReactorControl<T> {
+        let num_listeners = 255;
+        let conn_slots = cfg.max_connections + num_listeners + 1;
+        let timer_slots = (conn_slots * cfg.timers_per_connection)
 
         ReactorControl {
             listeners: Slab::new_starting_at(Token(0), 255),
-            conns: Slab::new_starting_at(Token(256), cfg.max_connections + 256),
+            conns: Slab::new_starting_at(Token(num_listeners + 1), conn_slots),
+            timers: Slab::new_starting_at(Token(0), timer_slots),
             handler: handler,
             config: cfg
         }
