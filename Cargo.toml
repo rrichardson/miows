@@ -7,3 +7,7 @@ authors = ["Rick Richardson <rick.richardson@gmail.com>"]
 [dependencies]
 websocket = "*"
 mio = "*"
+block_allocator = "*"
+iobuf = "*"
+bytes = "*"
+log = "*"

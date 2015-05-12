@@ -1,37 +1,29 @@
+use std::time::duration::Duration;
+use std::io::Error;
 use mio::Sender;
-use mio::EventLoop;
-
-use reactor_control::*;
+use mio::{EventLoop, EventLoopConfig, Token, TimerResult, Timeout};
+use reactor_control::{ReactorHandler, ReactorControl, ReactorConfig, TaggedBuf};
 use block_allocator::Allocator;
 use protocol::Protocol;
 
 
-/// Configuration for the Reactor
-/// queue_size: All queues, both inbound and outbound
-/// read_buf_sz: The size of the read buffer allocatod
-pub struct ReactorConfig {
-    out_queue_size: usize,
-    max_connections: usize,
-    timers_per_connection: usize,
-    poll_timeout_ms: usize,
-}
 
-pub struct Reactor<T, H>
-where T : Protocol, <T as Protocol>::Output : Send,
-      H : ReactorHandler<<T as Protocol>::Output>
+pub struct Reactor<P, H>
+where P : Protocol, <P as Protocol>::Output : Send,
+      H : ReactorHandler<P>
 {
-    inner: ReactorControl<T, H>,
-    event_loop: EventLoop<ReactorControl<T, H>>
+    inner: ReactorControl<P, H>,
+    event_loop: EventLoop<ReactorControl<P, H>>
 }
 
 
-impl<T> Reactor<T, H>
-where T : Protocol, <T as Protocol>::Output : Send,
-      H : ReactorHandler<<T as Protocol>::Output>
+impl<P, H> Reactor<P, H>
+where P : Protocol, <P as Protocol>::Output : Send,
+      H : ReactorHandler<P>
 {
 
     /// Construct a new Reactor with (hopefully) intelligent defaults
-    pub fn new(handler : H) -> Reactor<T, H> {
+    pub fn new(handler : H) -> Reactor<P, H> {
         let config = ReactorConfig {
             out_queue_size: 524288,
             max_connections: 10240,
@@ -43,10 +35,11 @@ where T : Protocol, <T as Protocol>::Output : Send,
     }
 
     /// Construct a new engine with defaults specified by the user
-    pub fn configured(handler : H, cfg: ReactorConfig) -> Reactor<T> {
+    pub fn configured(handler : H, cfg: ReactorConfig) -> Reactor<P, H> {
         Reactor { event_loop: EventLoop::configured(
-                    EventLoop::<ReactorInner<T>>::event_loop_config(
-                        cfg.out_queue_size, cfg.poll_timeout_ms, config.max_timetouts)).unwrap(),
+                    Self::event_loop_config(
+                        cfg.out_queue_size, cfg.poll_timeout_ms,
+                        (cfg.max_connections * cfg.timers_per_connection))).unwrap(),
                   inner: ReactorControl::new(handler, cfg)
         }
     }
@@ -67,7 +60,7 @@ where T : Protocol, <T as Protocol>::Output : Send,
     /// and sent down the supplied Sender channel along with the Token of the connection
     pub fn connect<'b>(&mut self,
                    hostname: &str,
-                   port: usize) -> Result<Token, String> {
+                   port: usize) -> Result<Token, Error> {
         self.inner.connect(hostname, port, &mut self.event_loop)
     }
 
@@ -78,12 +71,12 @@ where T : Protocol, <T as Protocol>::Output : Send,
     /// this can be called multiple times for different ips/ports
     pub fn listen<'b>(&mut self,
                   addr: &'b str,
-                  port: usize) -> Result<Token, String> {
+                  port: usize) -> Result<Token, Error> {
         self.inner.listen(addr, port, &mut self.event_loop)
     }
 
     /// fetch the event_loop channel for notifying the event_loop of new outbound data
-    pub fn channel(&self) -> Sender<ReactorControl<T, H>> {
+    pub fn channel(&self) -> Sender<TaggedBuf> {
         self.event_loop.channel()
     }
 
@@ -91,24 +84,25 @@ where T : Protocol, <T as Protocol>::Output : Send,
     /// Minimum expected resolution is the tick duration of the event loop
     /// poller, but it could be shorted depending on how many events are
     /// occurring
-    pub fn timeout(&mut self, timeout: Duration, callback: Box<TimerCB<'a>>) {
-        let tok = self.inner.timeouts.insert((callback, None)).map_err(|_|()).unwrap();
-        let handle = self.event_loop.timeout(tok, timeout).unwrap();
+    pub fn timeout(&mut self, duration: u64, cid: u64) -> TimerResult<Timeout> {
+        let tok = self.inner.timeouts.insert((cid, None)).map_err(|_| format!("failed")).unwrap();
+        let handle = self.event_loop.timeout_ms(tok.0 as u64, duration).unwrap();
         self.inner.timeouts.get_mut(tok).unwrap().1 = Some(handle);
+        Ok(handle)
     }
 
     /// process all incoming and outgoing events in a loop
-    pub fn run(mut self) {
-        self.event_loop.run(self.inner).map_err(|_| ()).unwrap();
+    pub fn run(&mut self) {
+        self.event_loop.run(&mut self.inner).map_err(|_| ()).unwrap();
     }
 
     /// process all incoming and outgoing events in a loop
-    pub fn run_once(mut self) {
-        self.event_loop.run_once(self.inner).map_err(|_| ()).unwrap();
+    pub fn run_once(&mut self) {
+        self.event_loop.run_once(&mut self.inner).map_err(|_| ()).unwrap();
     }
 
     /// calculates the 11th digit of pi
-    pub fn shutdown(mut self) {
+    pub fn shutdown(&mut self) {
         self.event_loop.shutdown();
     }
 }

@@ -4,10 +4,13 @@ extern crate mio;
 extern crate iobuf;
 extern crate bytes;
 
-pub use reactor;
-pub use reactor_control;
-pub use protocol;
-use connection;
+#[macro_use]
+extern crate log;
+
+pub mod reactor;
+pub mod reactor_control;
+pub mod protocol;
+mod connection;
 
 #[test]
 fn it_works() {
