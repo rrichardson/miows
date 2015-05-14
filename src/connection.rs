@@ -4,7 +4,7 @@ use mio::tcp::TcpStream;
 use mio::{Buf, TryWrite, Interest};
 use std::marker::PhantomData;
 
-pub struct OutBuf (AROIobuf);
+pub struct OutBuf (AROIobuf, usize);
 
 impl Buf for OutBuf {
     fn remaining(&self) -> usize {
@@ -20,11 +20,18 @@ impl Buf for OutBuf {
     }
 }
 
+enum ConnectionState {
+    Ready,
+    InProgress
+}
+
 pub struct Connection
 {
     pub sock: TcpStream,
-    pub outbuf: VecDeque<AROIobuf>,
+    pub token: Option<Token>,
+    pub outbuf: VecDeque<OutBuf>,
     pub interest: Interest,
+    pub state: ConnectionState
 }
 
 impl Connection
@@ -32,35 +39,14 @@ impl Connection
     pub fn new(s: TcpStream) -> Connection {
         Connection {
             sock: s,
+            token: None,
             outbuf: VecDeque::new(),
             interest: Interest::hup(),
+            state: ConnectionState::InProgress
         }
     }
 
     pub fn drain_write_queue_to_socket(&mut self) -> usize {
-        let mut writable = true;
-        while writable && self.outbuf.len() > 0 {
-            let (result, sz) = {
-                let buf = self.outbuf.front_mut().unwrap(); //shouldn't panic because of len() check
-                let sz = buf.len();
-                (self.sock.write(&mut OutBuf(*buf)), sz as usize)
-            };
-            match result {
-                Ok(Some(n)) =>
-                {
-                    debug!("Wrote {:?} out of {:?} bytes to socket", n, sz);
-                    if n == sz {
-                        self.outbuf.pop_front(); // we have written the contents of this buffer so lets get rid of it
-                    }
-                },
-                Ok(None) => { // this is also very unlikely, we got a writable message, but failed
-                    // to write anything at all.
-                    debug!("Got Writable event for socket, but failed to write any bytes");
-                    writable = false;
-                },
-                Err(e) => { error!("error writing to socket: {:?}", e); writable = false }
-            }
-        }
         self.outbuf.len()
     }
 

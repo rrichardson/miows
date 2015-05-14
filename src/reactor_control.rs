@@ -5,12 +5,12 @@ use mio::tcp::{TcpStream, TcpListener};
 use mio::util::{Slab};
 use mio::{Token, EventLoop, Interest, PollOpt, ReadHint, Timeout, Handler};
 
-use protocol::Protocol;
+use protocol::{Protocol, Message};
 use connection::Connection;
 
 pub type TaggedBuf = (Token, AROIobuf);
 
-pub trait ReactorHandler<P>
+pub trait Mailbox<P>
 where P : Protocol, <P as Protocol>::Output : Send
 {
     fn on_message(&mut self, msg: <P as Protocol>::Output,
@@ -28,18 +28,18 @@ pub struct ReactorConfig {
 
 pub struct ReactorControl<P, H>
 where P : Protocol, <P as Protocol>::Output : Send,
-      H : ReactorHandler<P>
+      H : Mailbox<P>
 {
-    pub listeners: Slab<TcpListener>,
-    pub conns: Slab<(P, Connection)>,
-    pub timeouts: Slab<(u64, Option<Timeout>)>,
+    pub listeners: RefCell<Slab<TcpListener>>,
+    pub conns: RefCell<Slab<(P, Connection)>>,
+    pub timeouts: RefCell<Slab<(u64, Option<Timeout>)>>,
     pub config: ReactorConfig,
     pub handler: H
 }
 
 impl<P, H> ReactorControl<P, H>
 where P : Protocol, <P as Protocol>::Output : Send,
-      H : ReactorHandler<P>
+      H : Mailbox<P>
 {
 
     pub fn new(handler: H, cfg: ReactorConfig) -> ReactorControl<P, H> {
@@ -48,15 +48,15 @@ where P : Protocol, <P as Protocol>::Output : Send,
         let timer_slots = (conn_slots * cfg.timers_per_connection);
 
         ReactorControl {
-            listeners: Slab::new_starting_at(Token(0), 255),
-            conns: Slab::new_starting_at(Token(num_listeners + 1), conn_slots),
-            timeouts: Slab::new_starting_at(Token(0), timer_slots),
+            listeners: RefCell::new(Slab::new_starting_at(Token(0), 255)),
+            conns: RefCell::new(Slab::new_starting_at(Token(num_listeners + 1), conn_slots)),
+            timeouts: RefCell::new(Slab::new_starting_at(Token(0), timer_slots)),
             handler: handler,
             config: cfg
         }
     }
 
-    pub fn connect<'b>(&mut self,
+    pub fn connect<'b>(&self,
                    addr: &'b str,
                    port: usize,
                    event_loop: &mut EventLoop<ReactorControl<P, H>>) -> Result<Token, Error>
@@ -73,13 +73,10 @@ where P : Protocol, <P as Protocol>::Output : Send,
                 .map_err(|_|Error::new(ErrorKind::Other, "Failed to insert into slab")));
         try!(event_loop.register_opt(&self.conns.get_mut(tok).unwrap().1.sock,
                                      tok, Interest::readable(), PollOpt::edge()));
-        if let Some(msg) = self.conns.get_mut(tok).unwrap().0.on_connect(tok.0) {
-            self.handler.on_message(msg, self);
-        }
         Ok(tok)
     }
 
-    pub fn listen<'b>(&mut self,
+    pub fn listen<'b>(&self,
                       addr: &'b str,
                       port: usize,
                       event_loop: &mut EventLoop<ReactorControl<P, H>>) -> Result<Token, Error>
@@ -89,12 +86,14 @@ where P : Protocol, <P as Protocol>::Output : Send,
         let server = try!(TcpListener::bind(&saddr));
         let tok = try!(self.listeners.insert(server)
                 .map_err(|_|Error::new(ErrorKind::Other, "Failed to insert into slab")));
+        let tup : &mut (P, Connection) = self.conns.get_mut(tok).unwrap();
+        tup.1.token = Some(tok);
         try!(event_loop.register_opt(self.listeners.get_mut(tok).unwrap(),
             tok, Interest::readable(), PollOpt::edge()));
         Ok(tok)
     }
 
-    pub fn accept(&mut self, event_loop: &mut EventLoop<ReactorControl<P, H>>,
+    pub fn accept(&self, event_loop: &mut EventLoop<ReactorControl<P, H>>,
                   token: Token, hint: ReadHint) -> Result<Token, Error> {
 
         let ref mut accpt = *self.listeners.get_mut(token).unwrap();
@@ -106,8 +105,9 @@ where P : Protocol, <P as Protocol>::Output : Send,
                 tok, Interest::readable() | Interest::hup(), PollOpt::edge()));
             let tup : &mut (P, Connection) = self.conns.get_mut(tok).unwrap();
             let peeraddr = try!(tup.1.sock.peer_addr());
+            tup.1.token = Some(tok);
             if let Some(msg) = tup.0.on_accept(tok.0, peeraddr) {
-                self.handler.on_message(msg, self);
+                self.dispatch(msg);
             }
             try!(event_loop.reregister(accpt, token, Interest::readable(), PollOpt::edge()));
             return Ok(tok);
@@ -117,14 +117,23 @@ where P : Protocol, <P as Protocol>::Output : Send,
         }
     }
 
-    pub fn on_read(&mut self, event_loop: &mut EventLoop<ReactorControl<P, H>>, token: Token, hint: ReadHint) {
+    pub fn on_read(&self, event_loop: &mut EventLoop<ReactorControl<P, H>>, token: Token, hint: ReadHint) {
 
         let mut close = false;
-        let tup : &mut (P, Connection) = self.conns.get_mut(token).unwrap();
-        if let Some(msg) = tup.0.on_data(&mut tup.1.sock) {
-            self.handler.on_message(msg, self);
+        let &mut (ref proto, ref mut conn) : &mut (P, Connection) = self.conns.get_mut(token).unwrap();
+        match conn.state {
+            InProgress => {
+                conn.state = ConnectionState::Ready;
+                if let Some(msg) = self.conns.get_mut(tok).unwrap().0.on_connect(tok.0) {
+                    self.dispatch(msg);
+                }
+            },
+            Ready => {
+                if let Some(msg) = tup.0.on_data(&mut tup.1.sock) {
+                    self.dispatch(msg):
+                }
+            }
         }
-
         if hint.contains(ReadHint::hup()) {
             close = true;
         }
@@ -136,15 +145,27 @@ where P : Protocol, <P as Protocol>::Output : Send,
         if close {
             self.conns.remove(token);
             if let Some(msg) = tup.0.on_disconnect(token.0) {
-                self.handler.on_message(msg, self);
+                self.dispatch(msg);
             }
+        }
+    }
+
+    fn dispatch(&self, msg : &Message, conn : &mut Connection, event_loop: &mut EventLoop<ReactorControl<P, H>>) {
+        match Protocol::Message {
+            Out(msg) => self.mailbox.on_message(msg, self),
+            Write(buf, mid) => conn.enqueue(buf, mid),
+            Timer(delay, tid) => self.timeout(delay, tid),
+            Clear(tid) => {
+                event_loop.clear_timeout(tid),
+            Kill(buf) => self.conns.remove(conn.token),
+            Cons(m, n) => { self.dispatch(m); self.dispatch(n) }
         }
     }
 }
 
 impl<P, H> Handler for ReactorControl<P, H>
 where P : Protocol, <P as Protocol>::Output : Send,
-      H : ReactorHandler<P>
+      H : Mailbox<P>
 {
     type Timeout = u64;
     type Message = TaggedBuf;
@@ -160,10 +181,39 @@ where P : Protocol, <P as Protocol>::Output : Send,
 
     fn writable(&mut self, event_loop: &mut EventLoop<ReactorControl<P, H>>, token: Token) {
         debug!("mio_processor::writable, token: {:?}", token);
-        if let Some(&mut (_, ref mut c)) = self.conns.get_mut(token) {
-            if c.drain_write_queue_to_socket() > 0 {
-                    c.interest.insert(Interest::writable());
-                    event_loop.reregister(&c.sock, token, c.interest, PollOpt::edge()).unwrap();
+
+        if let Some(&mut (ref mut proto, ref mut c)) = self.conns.get_mut(token) {
+
+            let mut writable = true;
+            while writable && c.outbuf.len() > 0 {
+                let (result, sz, mid) = {
+                    let (buf, mid) = c.front_mut().unwrap(); //shouldn't panic because of len() check
+                    let sz = buf.len();
+                    (self.sock.write(&mut OutBuf(*buf.0)), sz as usize, mid)
+                };
+                match result {
+                    Ok(Some(n)) =>
+                    {
+                        debug!("Wrote {:?} out of {:?} bytes to socket", n, sz);
+                        if n == sz {
+                            self.outbuf.pop_front(); // we have written the contents of this buffer so lets get rid of it
+                            if let Some(msg) = proto.on_write(mid) {
+                                self.dispatch(msg):
+                            }
+                        }
+                    },
+                    Ok(None) => { // this is also very unlikely, we got a writable message, but failed
+                        // to write anything at all.
+                        debug!("Got Writable event for socket, but failed to write any bytes");
+                        writable = false;
+                    },
+                    Err(e) => { error!("error writing to socket: {:?}", e); writable = false }
+                }
+            }
+
+            if self.outbuf.len() > 0 {
+                c.interest.insert(Interest::writable());
+                event_loop.reregister(&c.sock, token, c.interest, PollOpt::edge()).unwrap();
             }
         }
     }
@@ -171,18 +221,16 @@ where P : Protocol, <P as Protocol>::Output : Send,
 
     fn notify(&mut self, event_loop: &mut EventLoop<ReactorControl<P, H>>, msg: TaggedBuf) {
         let tok = msg.0;
-        if let Some(&mut (_, ref mut c)) = self.conns.get_mut(tok) {
-            c.enqueue(&msg.1);
-            if c.drain_write_queue_to_socket() > 0 {
-                c.interest.insert(Interest::writable());
-                event_loop.reregister(&c.sock, tok, c.interest, PollOpt::edge()).unwrap();
+        if let Some(&mut (ref mut proto, ref mut c)) = self.conns.get_mut(tok) {
+            if let Some(msg) = proto.notify(mid) {
+                self.dispatch(msg):
             }
         }
     }
 
     fn timeout(&mut self, event_loop: &mut EventLoop<ReactorControl<P, H>>, timeout : u64) {
-        let (ref mut cid, ref handle) = *self.timeouts.get_mut(Token(timeout as usize)).unwrap();
-        let (ref mut proto, _) = *self.conns.get_mut(Token(*cid as usize)).unwrap();
+        let &mut (ref cid, ref handle) = self.timeouts.get_mut(Token(timeout as usize)).unwrap();
+        let &mut (ref mut proto, _) = self.conns.get_mut(Token(*cid as usize)).unwrap();
         if let Some(msg) = proto.on_timer(timeout as usize) {
             event_loop.clear_timeout(handle.unwrap());
         }

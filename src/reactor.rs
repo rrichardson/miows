@@ -2,7 +2,7 @@ use std::time::duration::Duration;
 use std::io::Error;
 use mio::Sender;
 use mio::{EventLoop, EventLoopConfig, Token, TimerResult, Timeout};
-use reactor_control::{ReactorHandler, ReactorControl, ReactorConfig, TaggedBuf};
+use reactor_control::{Mailbox, ReactorControl, ReactorConfig, TaggedBuf};
 use block_allocator::Allocator;
 use protocol::Protocol;
 
@@ -10,7 +10,7 @@ use protocol::Protocol;
 
 pub struct Reactor<P, H>
 where P : Protocol, <P as Protocol>::Output : Send,
-      H : ReactorHandler<P>
+      H : Mailbox<P>
 {
     inner: ReactorControl<P, H>,
     event_loop: EventLoop<ReactorControl<P, H>>
@@ -19,7 +19,7 @@ where P : Protocol, <P as Protocol>::Output : Send,
 
 impl<P, H> Reactor<P, H>
 where P : Protocol, <P as Protocol>::Output : Send,
-      H : ReactorHandler<P>
+      H : Mailbox<P>
 {
 
     /// Construct a new Reactor with (hopefully) intelligent defaults
