@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use iobuf::{Iobuf, AROIobuf};
 use mio::tcp::TcpStream;
-use mio::{Buf, TryWrite, Interest};
+use mio::{Buf, Token, TryWrite, Interest};
 use std::marker::PhantomData;
 
-pub struct OutBuf (AROIobuf, usize);
+use protocol::Protocol;
+
+pub struct OutBuf (Token, AROIobuf);
 
 impl Buf for OutBuf {
     fn remaining(&self) -> usize {
@@ -20,21 +22,23 @@ impl Buf for OutBuf {
     }
 }
 
-enum ConnectionState {
+enum ConnectionStatus {
     Ready,
     InProgress
 }
 
-pub struct Connection
+pub struct Connection<P : Protocol>
 {
     pub sock: TcpStream,
     pub token: Option<Token>,
     pub outbuf: VecDeque<OutBuf>,
     pub interest: Interest,
-    pub state: ConnectionState
+    pub status: ConnectionStatus,
+    pub proto: P,
+    pub state: Option<<P as Protocol>::ConnectionState>,
 }
 
-impl Connection
+impl<P : Protocol> Connection<P>
 {
     pub fn new(s: TcpStream) -> Connection {
         Connection {
@@ -42,7 +46,9 @@ impl Connection
             token: None,
             outbuf: VecDeque::new(),
             interest: Interest::hup(),
-            state: ConnectionState::InProgress
+            status: ConnectionStatus::InProgress,
+            proto: P::new(),
+            state: None
         }
     }
 
