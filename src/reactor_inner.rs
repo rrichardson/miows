@@ -10,12 +10,10 @@ use connection::{Connection, OutBuf};
 
 pub type TaggedBuf = (Token, AROIobuf);
 
-pub trait Mailbox<P>
-where P : Protocol, <P as Protocol>::Output : Send
-{
-    fn on_message(&mut self, msg: <P as Protocol>::Output,
-                  ctrl : &mut ReactorInner<P, Self>);
-}
+pub type ProtocoRef = Rc<RefCell<Box<Protocol>>>;
+
+type ConnRecord = (ProtocolRef, Box<Connection<Protocol>>);
+type Listener = (ProtocolRef, TcpListener);
 
 /// Configuration for the Reactor
 /// queue_size: All queues, both inbound and outbound
@@ -26,23 +24,19 @@ pub struct ReactorConfig {
     pub poll_timeout_ms: usize,
 }
 
-pub struct ReactorInner<P, H>
-where P : Protocol, <P as Protocol>::Output : Send,
-      H : Mailbox<P>
+pub struct ReactorInner
 {
-    pub listeners: RefCell<Slab<TcpListener>>,
-    pub conns: RefCell<Slab<(P, Connection)>>,
+    pub listeners: RefCell<Slab<Listener>>,
+    pub conns: RefCell<Slab<ConnRecord>>,
     pub timeouts: RefCell<Slab<(u64, Option<Timeout>)>>,
     pub config: ReactorConfig,
     pub handler: H
 }
 
-impl<P, H> ReactorInner<P, H>
-where P : Protocol, <P as Protocol>::Output : Send,
-      H : Mailbox<P>
+impl ReactorInner
 {
 
-    pub fn new(handler: H, cfg: ReactorConfig) -> ReactorInner<P, H> {
+    pub fn new(handler: H, cfg: ReactorConfig) -> ReactorInner {
         let num_listeners = 255;
         let conn_slots = cfg.max_connections + num_listeners + 1;
         let timer_slots = (conn_slots * cfg.timers_per_connection);
@@ -59,7 +53,8 @@ where P : Protocol, <P as Protocol>::Output : Send,
     pub fn connect<'b>(&self,
                    addr: &'b str,
                    port: usize,
-                   event_loop: &mut EventLoop<ReactorInner<P, H>>) -> Result<Token, Error>
+                   event_loop: &mut EventLoop<ReactorInner<P, H>>,
+                   proto: ProtocolRef) -> Result<Token, Error>
     {
         let saddr = try!(lookup_host(addr).and_then(|lh| lh.nth(0)
                             .ok_or(Error::last_os_error()))
@@ -69,7 +64,7 @@ where P : Protocol, <P as Protocol>::Output : Send,
                             Err(_) => return Err(Error::new(ErrorKind::Other, "Failed to parse Supplied socket address"))
                         }}));
         let sock = try!(TcpStream::connect(&saddr));
-        let tok = try!(self.conns.insert((P::new(), Connection::new(sock)))
+        let tok = try!(self.conns.insert((proto.clone(), Box::new(Connection::new(sock))))
                 .map_err(|_|Error::new(ErrorKind::Other, "Failed to insert into slab")));
         try!(event_loop.register_opt(&self.conns.get_mut(tok).unwrap().1.sock,
                                      tok, Interest::readable(), PollOpt::edge()));
@@ -79,35 +74,35 @@ where P : Protocol, <P as Protocol>::Output : Send,
     pub fn listen<'b>(&self,
                       addr: &'b str,
                       port: usize,
-                      event_loop: &mut EventLoop<ReactorInner<P, H>>) -> Result<Token, Error>
+                      event_loop: &mut EventLoop<ReactorInner<P, H>>,
+                      proto: ProtocolRef) -> Result<Token, Error>
     {
         let saddr : SocketAddr = try!(addr.parse()
                 .map_err(|_| Error::new(ErrorKind::Other, "Failed to parse address")));
         let server = try!(TcpListener::bind(&saddr));
-        let tok = try!(self.listeners.insert(server)
+        let tok = try!(self.listeners.insert((proto, server))
                 .map_err(|_|Error::new(ErrorKind::Other, "Failed to insert into slab")));
-        let tup : &mut (P, Connection) = self.conns.get_mut(tok).unwrap();
-        tup.1.token = Some(tok);
-        try!(event_loop.register_opt(self.listeners.get_mut(tok).unwrap(),
-            tok, Interest::readable(), PollOpt::edge()));
+        let &mut (ref proto, ref mut l) = self.conns.get_mut(tok).unwrap();
+        try!(event_loop.register_opt(l, tok, Interest::readable(), PollOpt::edge()));
         Ok(tok)
     }
 
     pub fn accept(&self, event_loop: &mut EventLoop<ReactorInner<P, H>>,
                   token: Token, hint: ReadHint) -> Result<Token, Error> {
 
-        let ref mut accpt = *self.listeners.get_mut(token).unwrap();
+        let &mut (ref proto, ref mut accpt) = *self.listeners.get_mut(token).unwrap();
 
         if let Some(sock) = try!(accpt.accept()) {
-            let tok = try!(self.conns.insert((P::new(), Connection::new(sock)))
+            let peeraddr = try!(conn.sock.peer_addr());
+            if !proto.borrow_mut().pre_accept(peeraddr) {
+                return Error::new(ErrorKind::Other, format!("Connection from {} rejected", peeraddr));
+            }
+            let tok = try!(self.conns.insert((proto.clone(), Box::new(Connection::new(sock))))
                 .map_err(|_|Error::new(ErrorKind::Other, "Failed to insert into slab")));
-            try!(event_loop.register_opt(&self.conns.get(tok).unwrap().1.sock,
-                tok, Interest::readable() | Interest::hup(), PollOpt::edge()));
-            let tup : &mut (P, Connection) = self.conns.get_mut(tok).unwrap();
-            let peeraddr = try!(tup.1.sock.peer_addr());
-            tup.1.token = Some(tok);
-            if let Some(msg) = tup.0.on_accept(tok.0, peeraddr) {
-                self.dispatch(msg);
+            let &mut (ref proto, ref mut conn) = self.conns.get_mut(tok).unwrap();
+            if let Some(int) = proto.borrow_mut().on_accept(conn,  peeraddr) {
+                try!(event_loop.register_opt(conn.sock,
+                    tok, int | Interest::hup(), PollOpt::edge()));
             }
             try!(event_loop.reregister(accpt, token, Interest::readable(), PollOpt::edge()));
             return Ok(tok);
@@ -120,45 +115,24 @@ where P : Protocol, <P as Protocol>::Output : Send,
     pub fn on_read(&self, event_loop: &mut EventLoop<ReactorInner<P, H>>, token: Token, hint: ReadHint) {
 
         let mut close = false;
-        let &mut (ref proto, ref mut conn) : &mut (P, Connection) = self.conns.get_mut(token).unwrap();
+        let &mut (ref proto, ref mut conn) = self.conns.get_mut(token).unwrap();
         match conn.state {
             InProgress => {
                 conn.state = ConnectionState::Ready;
-                if let Some(msg) = self.conns.get_mut(tok).unwrap().0.on_connect(tok.0) {
-                    self.dispatch(msg);
+                if let Some(int) = proto.borrow_mut().on_connect(conn) {
+                    try!(event_loop.register_opt(conn.sock,
+                        tok, int | Interest::hup(), PollOpt::edge()));
                 }
             },
             Ready => {
-                if let Some(msg) = tup.0.on_data(&mut tup.1.sock) {
-                    self.dispatch(msg):
+                if let Some(int) = tup.0.on_data(conn) {
+                    try!(event_loop.reregister(accpt, token, int | Interest::hup(), PollOpt::edge()));
                 }
             }
         }
         if hint.contains(ReadHint::hup()) {
-            close = true;
-        }
-        else {
-            tup.1.interest.insert(Interest::readable());
-            event_loop.reregister(&tup.1.sock, token, tup.1.interest, PollOpt::edge()).unwrap();
-        }
-
-        if close {
+            proto.on_disconnect(conn);
             self.conns.remove(token);
-            if let Some(msg) = tup.0.on_disconnect(token.0) {
-                self.dispatch(msg);
-            }
-        }
-    }
-
-    fn dispatch(&self, msg : &Message, conn : &mut Connection, event_loop: &mut EventLoop<ReactorInner<P, H>>) {
-        match Protocol::Message {
-            Out(msg) => self.mailbox.on_message(msg, self),
-            Write(buf, mid) => conn.enqueue(buf, mid),
-            Timer(delay, tid) => self.timeout(delay, tid),
-            Clear(tid) => {
-                event_loop.clear_timeout(tid),
-            Kill(buf) => self.conns.remove(conn.token),
-            Cons(m, n) => { self.dispatch(m); self.dispatch(n) }
         }
     }
 }
@@ -230,9 +204,20 @@ where P : Protocol, <P as Protocol>::Output : Send,
 
     fn timeout(&mut self, event_loop: &mut EventLoop<ReactorInner<P, H>>, timeout : u64) {
         let &mut (ref cid, ref handle) = self.timeouts.get_mut(Token(timeout as usize)).unwrap();
-        let &mut (ref mut proto, _) = self.conns.get_mut(Token(*cid as usize)).unwrap();
-        if let Some(msg) = proto.on_timer(timeout as usize) {
+        let &mut (ref proto, ref mut conn) = self.conns.get_mut(Token(*cid as usize)).unwrap();
+        let mut delay : Option<(u64, u64)> = None;
+        let mut clear = false;
+        match proto.borrow_mut().on_timer(Token(timeout), conn, ctrl) {
+            Replace((dly, id)) => delay = { delay = Some(dly, id); clear = true },
+            Restart => { }
+            RestartAndAdd((dly, id)) => delay = Some(dly, id),
+            Clear => clear = true
+        }
+        if clear {
             event_loop.clear_timeout(handle.unwrap());
+        }
+        if let Some((dly, id)) = delay {
+            event_loop.timeout_ms(
         }
     }
 }

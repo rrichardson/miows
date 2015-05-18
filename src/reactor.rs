@@ -8,11 +8,10 @@ use protocol::Protocol;
 
 
 
-pub struct Reactor<P, H>
-where P : Protocol, <P as Protocol>::Output : Send,
-      H : Mailbox<P>
+pub struct Reactor
+where
 {
-    inner: ReactorInner<P, H>,
+    inner: ReactorInner
     event_loop: EventLoop<ReactorInner<P, H>>
 }
 

@@ -34,7 +34,6 @@ pub struct Connection<P : Protocol>
     pub outbuf: VecDeque<OutBuf>,
     pub interest: Interest,
     pub status: ConnectionStatus,
-    pub proto: P,
     pub state: Option<<P as Protocol>::ConnectionState>,
 }
 
@@ -47,7 +46,6 @@ impl<P : Protocol> Connection<P>
             outbuf: VecDeque::new(),
             interest: Interest::hup(),
             status: ConnectionStatus::InProgress,
-            proto: P::new(),
             state: None
         }
     }
